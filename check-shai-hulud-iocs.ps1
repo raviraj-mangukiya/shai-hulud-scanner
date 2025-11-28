@@ -80,6 +80,18 @@ function Get-FileHash256 {
     }
 }
 
+# Function to calculate SHA-1 hash
+function Get-FileHash1 {
+    param([string]$FilePath)
+    try {
+        $hash = Get-FileHash -Path $FilePath -Algorithm SHA1 -ErrorAction Stop
+        return $hash.Hash.ToLower()
+    }
+    catch {
+        return $null
+    }
+}
+
 # Function to check for postinstall scripts in package.json files
 function Check-PostinstallScripts {
     Write-Host "[1/5] Checking for malicious 'postinstall' scripts in package.json files..." -ForegroundColor Green
@@ -294,32 +306,127 @@ function Check-FileHashes {
     Write-Host "[4/5] Checking for known malicious file hashes..." -ForegroundColor Green
     
     $knownHashes = $iocs.patterns.known_hashes
+    $knownHashesSha1 = $iocs.patterns.known_hashes_sha1
+    
+    # Support both old format (array of SHA256 strings) and new format (object with sha256/sha1 arrays)
+    if ($knownHashes -is [System.Array] -and $knownHashes.Count -gt 0) {
+        # Old format - convert to new structure
+        $hashList = @()
+        foreach ($hash in $knownHashes) {
+            if ($hash -is [System.String]) {
+                $hashList += @{ sha256 = $hash; filename = "bundle.js" }
+            } elseif ($hash -is [System.Collections.Hashtable] -or $hash -is [PSCustomObject]) {
+                $hashList += $hash
+            }
+        }
+        $knownHashes = $hashList
+    }
+    
+    if ($knownHashesSha1) {
+        foreach ($hashEntry in $knownHashesSha1) {
+            if ($hashEntry -is [System.Collections.Hashtable] -or $hashEntry -is [PSCustomObject]) {
+                $knownHashes += $hashEntry
+            } elseif ($hashEntry -is [System.String]) {
+                # Assume it's a hash, try to infer filename from context
+                $knownHashes += @{ sha1 = $hashEntry; filename = "" }
+            }
+        }
+    }
+    
     if (-not $knownHashes -or $knownHashes.Count -eq 0) {
         Write-Host "  No known hashes configured" -ForegroundColor Gray
         Write-Host ""
         return
     }
     
-    # Check bundle.js files
-    $bundleJsFiles = Get-ChildItem -Path $projectRoot -Filter "bundle.js" -Recurse -ErrorAction SilentlyContinue | 
-        Where-Object { $_.FullName -notmatch "node_modules[\\/]\.cache" }
+    if ($Verbose) {
+        Write-Host "  Checking against $($knownHashes.Count) known hash(es)" -ForegroundColor Gray
+    }
     
-    foreach ($file in $bundleJsFiles) {
-        $fileHash = Get-FileHash256 -FilePath $file.FullName
-        if ($fileHash -and $knownHashes -contains $fileHash) {
-            $result = @{
-                File = $file.FullName
-                Hash = $fileHash
-                IsKnownMalicious = $true
+    # Files to check: bundle.js, bun_environment.js, setup_bun.js, and any specific filenames from hash config
+    $targetFiles = @("bundle.js", "bun_environment.js", "setup_bun.js")
+    $specificFilenames = $knownHashes | Where-Object { $_.filename } | ForEach-Object { $_.filename } | Select-Object -Unique
+    $targetFiles += $specificFilenames | Where-Object { $_ -and $targetFiles -notcontains $_ }
+    
+    if ($Verbose) {
+        Write-Host "  Target files to check: $($targetFiles -join ', ')" -ForegroundColor Gray
+    }
+    
+    $totalFilesChecked = 0
+    $filesToCheck = @()
+    
+    foreach ($targetFile in $targetFiles) {
+        $foundFiles = Get-ChildItem -Path $projectRoot -Filter $targetFile -Recurse -ErrorAction SilentlyContinue | 
+            Where-Object { $_.FullName -notmatch "node_modules[\\/]\.cache" }
+        $filesToCheck += $foundFiles
+    }
+    
+    $totalFilesChecked = $filesToCheck.Count
+    
+    if ($Verbose) {
+        Write-Host "  Found $totalFilesChecked file(s) matching target filenames" -ForegroundColor Gray
+    }
+    
+    foreach ($file in $filesToCheck) {
+        if ($Verbose) {
+            Write-Host "    Checking: $($file.FullName)" -ForegroundColor Gray
+        }
+        
+        $fileHash256 = Get-FileHash256 -FilePath $file.FullName
+        $fileHash1 = Get-FileHash1 -FilePath $file.FullName
+        $fileName = $file.Name
+        
+        foreach ($hashEntry in $knownHashes) {
+            $isMatch = $false
+            $matchedHash = $null
+            $hashType = $null
+            
+            # Check SHA256
+            if ($hashEntry.sha256 -and $fileHash256 -and $fileHash256 -eq $hashEntry.sha256.ToLower()) {
+                $isMatch = $true
+                $matchedHash = $fileHash256
+                $hashType = "SHA256"
             }
-            $scanResults.FileHashes += $result
-            Write-Host "  [WARNING] Known malicious file hash detected: $($file.FullName)" -ForegroundColor Red
-            Write-Host "    Hash: $fileHash" -ForegroundColor Yellow
-            $foundIOCs += "Known malicious hash in $($file.FullName)"
+            # Check SHA1
+            elseif ($hashEntry.sha1 -and $fileHash1 -and $fileHash1 -eq $hashEntry.sha1.ToLower()) {
+                $isMatch = $true
+                $matchedHash = $fileHash1
+                $hashType = "SHA1"
+            }
+            # Support old format (just a hash string, assume SHA256)
+            elseif ($hashEntry -is [System.String] -and $fileHash256 -and $fileHash256 -eq $hashEntry.ToLower()) {
+                $isMatch = $true
+                $matchedHash = $fileHash256
+                $hashType = "SHA256"
+            }
+            
+            # If filename is specified in hash entry, verify it matches
+            if ($isMatch -and $hashEntry.filename) {
+                if ($fileName -ne $hashEntry.filename) {
+                    $isMatch = $false
+                }
+            }
+            
+            if ($isMatch) {
+                $result = @{
+                    File = $file.FullName
+                    Hash = $matchedHash
+                    HashType = $hashType
+                    IsKnownMalicious = $true
+                }
+                $scanResults.FileHashes += $result
+                Write-Host "  [WARNING] Known malicious file hash detected: $($file.FullName)" -ForegroundColor Red
+                Write-Host "    Hash ($hashType): $matchedHash" -ForegroundColor Yellow
+                if ($hashEntry.filename) {
+                    Write-Host "    Expected filename: $($hashEntry.filename)" -ForegroundColor Yellow
+                }
+                $foundIOCs += "Known malicious hash ($hashType) in $($file.FullName)"
+                break
+            }
         }
     }
     
-    Write-Host "  Checked $($bundleJsFiles.Count) bundle.js file(s)" -ForegroundColor $(if ($scanResults.FileHashes.Count -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "  Checked $totalFilesChecked file(s)" -ForegroundColor $(if ($scanResults.FileHashes.Count -gt 0) { "Yellow" } else { "Green" })
     Write-Host ""
 }
 
@@ -329,6 +436,10 @@ function Check-SuspiciousPackages {
     
     $bundleJsFiles = Get-ChildItem -Path $projectRoot -Filter "bundle.js" -Recurse -ErrorAction SilentlyContinue | 
         Where-Object { $_.FullName -notmatch "node_modules[\\/]\.cache" }
+    
+    if ($Verbose) {
+        Write-Host "  Scanning for bundle.js files..." -ForegroundColor Gray
+    }
     
     foreach ($file in $bundleJsFiles) {
         $result = @{
@@ -346,33 +457,134 @@ function Check-SuspiciousPackages {
         }
     }
     
-    $packageJsonFiles = Get-ChildItem -Path $projectRoot -Filter "package.json" -Recurse -ErrorAction SilentlyContinue
-    
     $suspiciousPackagePatterns = $iocs.patterns.suspicious_packages
     if (-not $suspiciousPackagePatterns) {
         $suspiciousPackagePatterns = @("shai-hulud", "bundle", "postinstall")
     }
     
+    if ($Verbose) {
+        Write-Host "  Using suspicious package patterns: $($suspiciousPackagePatterns -join ', ')" -ForegroundColor Gray
+    }
+    
+    # Check package.json files
+    $packageJsonFiles = Get-ChildItem -Path $projectRoot -Filter "package.json" -Recurse -ErrorAction SilentlyContinue
+    
+    if ($Verbose) {
+        Write-Host "  Found $($packageJsonFiles.Count) package.json file(s) to check" -ForegroundColor Gray
+    }
+    
+    $totalPackagesChecked = 0
+    $suspiciousPackagesFound = 0
+    
     foreach ($file in $packageJsonFiles) {
         try {
+            if ($Verbose) {
+                Write-Host "    Checking: $($file.FullName)" -ForegroundColor Gray
+            }
+            
             $content = Get-Content $file.FullName -Raw | ConvertFrom-Json
             
             $allDeps = @()
-            if ($content.dependencies) { $allDeps += $content.dependencies.PSObject.Properties.Name }
-            if ($content.devDependencies) { $allDeps += $content.devDependencies.PSObject.Properties.Name }
+            if ($content.dependencies) { 
+                $deps = $content.dependencies.PSObject.Properties.Name
+                $allDeps += $deps
+                if ($Verbose) {
+                    Write-Host "      Found $($deps.Count) dependency(ies)" -ForegroundColor Gray
+                }
+            }
+            if ($content.devDependencies) { 
+                $devDeps = $content.devDependencies.PSObject.Properties.Name
+                $allDeps += $devDeps
+                if ($Verbose) {
+                    Write-Host "      Found $($devDeps.Count) devDependency(ies)" -ForegroundColor Gray
+                }
+            }
+            
+            $totalPackagesChecked += $allDeps.Count
             
             foreach ($dep in $allDeps) {
                 foreach ($pattern in $suspiciousPackagePatterns) {
                     if ($dep -match $pattern -and $dep -ne "postinstall") {
+                        $suspiciousPackagesFound++
                         Write-Host "  [WARNING] Suspicious package name found: $dep in $($file.FullName)" -ForegroundColor Yellow
+                        Write-Host "    Matched pattern: $pattern" -ForegroundColor Yellow
                         $foundIOCs += "Suspicious package: $dep in $($file.FullName)"
                     }
                 }
             }
         }
         catch {
-            # Ignore parse errors
+            if ($Verbose) {
+                Write-Host "    [INFO] Could not parse package.json: $($file.FullName)" -ForegroundColor Gray
+            }
         }
+    }
+    
+    # Check package-lock.json files
+    $packageLockFiles = Get-ChildItem -Path $projectRoot -Filter "package-lock.json" -Recurse -ErrorAction SilentlyContinue
+    
+    if ($Verbose) {
+        Write-Host "  Found $($packageLockFiles.Count) package-lock.json file(s) to check" -ForegroundColor Gray
+    }
+    
+    foreach ($file in $packageLockFiles) {
+        try {
+            if ($Verbose) {
+                Write-Host "    Checking: $($file.FullName)" -ForegroundColor Gray
+            }
+            
+            $content = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            
+            $lockPackages = @()
+            if ($content.packages) {
+                # package-lock.json v2+ format
+                $lockPackages = $content.packages.PSObject.Properties.Name | Where-Object { $_ -ne "" }
+            } elseif ($content.dependencies) {
+                # package-lock.json v1 format
+                function Get-PackageNames {
+                    param($deps)
+                    $names = @()
+                    foreach ($dep in $deps.PSObject.Properties) {
+                        $names += $dep.Name
+                        if ($dep.Value.dependencies) {
+                            $names += Get-PackageNames -deps $dep.Value.dependencies
+                        }
+                    }
+                    return $names
+                }
+                $lockPackages = Get-PackageNames -deps $content.dependencies
+            }
+            
+            if ($Verbose) {
+                Write-Host "      Found $($lockPackages.Count) package(s) in lock file" -ForegroundColor Gray
+            }
+            
+            $totalPackagesChecked += $lockPackages.Count
+            
+            foreach ($pkg in $lockPackages) {
+                # Remove path prefix if present (e.g., "node_modules/package-name" -> "package-name")
+                $pkgName = $pkg -replace '^node_modules/', '' -replace '^.*node_modules/', ''
+                
+                foreach ($pattern in $suspiciousPackagePatterns) {
+                    if ($pkgName -match $pattern -and $pkgName -ne "postinstall") {
+                        $suspiciousPackagesFound++
+                        Write-Host "  [WARNING] Suspicious package name found in lock file: $pkgName in $($file.FullName)" -ForegroundColor Yellow
+                        Write-Host "    Matched pattern: $pattern" -ForegroundColor Yellow
+                        $foundIOCs += "Suspicious package in lock file: $pkgName in $($file.FullName)"
+                    }
+                }
+            }
+        }
+        catch {
+            if ($Verbose) {
+                Write-Host "    [INFO] Could not parse package-lock.json: $($file.FullName)" -ForegroundColor Gray
+            }
+        }
+    }
+    
+    if ($Verbose) {
+        Write-Host "  Total packages checked: $totalPackagesChecked" -ForegroundColor Gray
+        Write-Host "  Suspicious packages found: $suspiciousPackagesFound" -ForegroundColor $(if ($suspiciousPackagesFound -gt 0) { "Yellow" } else { "Green" })
     }
     
     if ($bundleJsFiles.Count -eq 0) {
@@ -403,11 +615,11 @@ $totalWarnings += $scanResults.FileHashes.Count
 $totalWarnings += ($scanResults.SuspiciousPackages | Where-Object { $_.IsSuspicious } | Measure-Object | Select-Object -ExpandProperty Count)
 
 if ($totalWarnings -eq 0) {
-    Write-Host "✓ No Shai-Hulud IOCs detected" -ForegroundColor Green
+    Write-Host "[OK] No Shai-Hulud IOCs detected" -ForegroundColor Green
     Write-Host ""
     exit 0
 } else {
-    Write-Host "⚠ Found $totalWarnings potential IOC(s):" -ForegroundColor Red
+    Write-Host "[WARNING] Found $totalWarnings potential IOC(s):" -ForegroundColor Red
     Write-Host ""
     
     foreach ($ioc in $foundIOCs) {

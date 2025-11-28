@@ -29,7 +29,24 @@
       "shai-hulud-workflow"
     ],
     "known_hashes": [
-      "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09"
+      {
+        "sha256": "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09",
+        "filename": "bundle.js"
+      }
+    ],
+    "known_hashes_sha1": [
+      {
+        "sha1": "d60ec97eea19fffb4809bc35b91033b52490ca11",
+        "filename": "bun_environment.js"
+      },
+      {
+        "sha1": "3d7570d14d34b0ba137d502f042b27b0f37a59fa",
+        "filename": "bun_environment.js"
+      },
+      {
+        "sha1": "d1829b4708126dcc7bea7437c04d1f10eacd4a16",
+        "filename": "setup_bun.js"
+      }
     ],
     "exfiltration_endpoints": [
       "webhook\\.site",

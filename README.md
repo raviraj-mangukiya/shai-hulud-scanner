@@ -87,9 +87,9 @@ Edit `config.json` to customize:
 - **IOC Sources**: Add or modify sources for downloading IOCs
 - **Update Interval**: How often to check for new IOCs (default: 24 hours)
 - **Patterns**: Customize detection patterns for:
-  - `postinstall_patterns`: Patterns to detect in postinstall scripts
-  - `suspicious_packages`: Package names to flag
-  - `suspicious_workflow_patterns`: Patterns in GitHub workflows
+  - `postinstall_patterns`: Regex patterns to detect in postinstall scripts
+  - `suspicious_packages`: Package name patterns to flag (regex matching against npm package names in `dependencies` and `devDependencies`). Default patterns: `shai-hulud`, `bundle`, `postinstall`. The scanner checks all package.json files and flags any package whose name matches these patterns (case-insensitive). Note: exact matches for "postinstall" are excluded since that's a script name, not a package.
+  - `suspicious_workflow_patterns`: Regex patterns in GitHub workflows
   - `known_hashes`: SHA-256 hashes of known malicious files
   - `exfiltration_endpoints`: Suspicious network endpoints
   - `suspicious_repositories`: Repository names to watch for

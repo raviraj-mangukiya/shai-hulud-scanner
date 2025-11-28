@@ -80,6 +80,18 @@ get_file_hash256() {
     fi
 }
 
+# Function to calculate SHA-1 hash
+get_file_hash1() {
+    local file_path="$1"
+    if command -v sha1sum >/dev/null 2>&1; then
+        sha1sum "$file_path" 2>/dev/null | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 1 "$file_path" 2>/dev/null | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]'
+    else
+        echo ""
+    fi
+}
+
 # Function to check for postinstall scripts
 check_postinstall_scripts() {
     echo -e "${GREEN}[1/5] Checking for malicious 'postinstall' scripts in package.json files...${NC}"
@@ -229,39 +241,141 @@ shai-hulud-workflow.yml"
 check_file_hashes() {
     echo -e "${GREEN}[4/5] Checking for known malicious file hashes...${NC}"
     
-    local known_hashes
+    local known_hashes=""
+    local known_hashes_sha1=""
+    
     if command -v jq >/dev/null 2>&1; then
-        known_hashes=$(echo "$IOCS" | jq -r '.patterns.known_hashes[]? // empty')
+        known_hashes=$(echo "$IOCS" | jq -c '.patterns.known_hashes[]? // empty' 2>/dev/null)
+        known_hashes_sha1=$(echo "$IOCS" | jq -c '.patterns.known_hashes_sha1[]? // empty' 2>/dev/null)
     fi
     
-    if [ -z "$known_hashes" ]; then
+    if [ -z "$known_hashes" ] && [ -z "$known_hashes_sha1" ]; then
         echo -e "  ${GRAY}No known hashes configured${NC}"
         echo ""
         return
     fi
     
-    local bundle_js_count=0
+    if [ "$VERBOSE" = "true" ]; then
+        local hash_count=0
+        if [ -n "$known_hashes" ]; then
+            hash_count=$(echo "$known_hashes" | wc -l | tr -d ' ')
+        fi
+        if [ -n "$known_hashes_sha1" ]; then
+            local sha1_count=$(echo "$known_hashes_sha1" | wc -l | tr -d ' ')
+            hash_count=$((hash_count + sha1_count))
+        fi
+        echo -e "  ${GRAY}Checking against $hash_count known hash(es)${NC}"
+    fi
+    
+    # Files to check: bundle.js, bun_environment.js, setup_bun.js, and any specific filenames from hash config
+    local target_files=("bundle.js" "bun_environment.js" "setup_bun.js")
+    
+    if command -v jq >/dev/null 2>&1; then
+        # Extract unique filenames from hash configs
+        local specific_files=$(echo "$IOCS" | jq -r '.patterns.known_hashes[]?.filename // empty, .patterns.known_hashes_sha1[]?.filename // empty' 2>/dev/null | sort -u)
+        while IFS= read -r filename; do
+            if [ -n "$filename" ]; then
+                # Check if filename is already in target_files
+                local found=0
+                for target in "${target_files[@]}"; do
+                    if [ "$target" = "$filename" ]; then
+                        found=1
+                        break
+                    fi
+                done
+                if [ $found -eq 0 ]; then
+                    target_files+=("$filename")
+                fi
+            fi
+        done <<< "$specific_files"
+    fi
+    
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "  ${GRAY}Target files to check: $(IFS=', '; echo "${target_files[*]}")${NC}"
+    fi
+    
+    local total_files_checked=0
     local suspicious_count=0
     
-    while IFS= read -r -d '' file; do
-        bundle_js_count=$((bundle_js_count + 1))
-        local file_hash=$(get_file_hash256 "$file")
-        
-        if [ -n "$file_hash" ]; then
-            while IFS= read -r known_hash; do
-                if [ -n "$known_hash" ] && [ "$file_hash" = "$known_hash" ]; then
-                    suspicious_count=$((suspicious_count + 1))
-                    echo -e "  ${RED}[WARNING] Known malicious file hash detected: $file${NC}"
-                    echo -e "    ${YELLOW}Hash: $file_hash${NC}"
-                    FOUND_IOCS+=("Known malicious hash in $file")
-                    WARNINGS=$((WARNINGS + 1))
-                    break
-                fi
-            done <<< "$known_hashes"
-        fi
-    done < <(find "$PROJECT_ROOT" -name "bundle.js" -type f ! -path "*/node_modules/.cache/*" -print0 2>/dev/null)
+    for target_file in "${target_files[@]}"; do
+        while IFS= read -r -d '' file; do
+            total_files_checked=$((total_files_checked + 1))
+            
+            if [ "$VERBOSE" = "true" ]; then
+                echo -e "    ${GRAY}Checking: $file${NC}"
+            fi
+            
+            local file_hash256=$(get_file_hash256 "$file")
+            local file_hash1=$(get_file_hash1 "$file")
+            local file_name=$(basename "$file")
+            local is_match=false
+            local matched_hash=""
+            local hash_type=""
+            
+            # Check SHA256 hashes
+            if [ -n "$known_hashes" ] && [ -n "$file_hash256" ]; then
+                while IFS= read -r hash_entry; do
+                    if [ -z "$hash_entry" ]; then
+                        continue
+                    fi
+                    
+                    local hash_sha256=$(echo "$hash_entry" | jq -r '.sha256 // empty' 2>/dev/null)
+                    local hash_filename=$(echo "$hash_entry" | jq -r '.filename // empty' 2>/dev/null)
+                    
+                    # If it's a plain string (old format), use it as SHA256
+                    if [ -z "$hash_sha256" ] && echo "$hash_entry" | grep -qE '^[0-9a-f]{64}$'; then
+                        hash_sha256="$hash_entry"
+                    fi
+                    
+                    if [ -n "$hash_sha256" ] && [ "$file_hash256" = "$(echo "$hash_sha256" | tr '[:upper:]' '[:lower:]')" ]; then
+                        # If filename is specified, verify it matches
+                        if [ -z "$hash_filename" ] || [ "$file_name" = "$hash_filename" ]; then
+                            is_match=true
+                            matched_hash="$file_hash256"
+                            hash_type="SHA256"
+                            break
+                        fi
+                    fi
+                done <<< "$known_hashes"
+            fi
+            
+            # Check SHA1 hashes
+            if [ "$is_match" = "false" ] && [ -n "$known_hashes_sha1" ] && [ -n "$file_hash1" ]; then
+                while IFS= read -r hash_entry; do
+                    if [ -z "$hash_entry" ]; then
+                        continue
+                    fi
+                    
+                    local hash_sha1=$(echo "$hash_entry" | jq -r '.sha1 // empty' 2>/dev/null)
+                    local hash_filename=$(echo "$hash_entry" | jq -r '.filename // empty' 2>/dev/null)
+                    
+                    if [ -n "$hash_sha1" ] && [ "$file_hash1" = "$(echo "$hash_sha1" | tr '[:upper:]' '[:lower:]')" ]; then
+                        # If filename is specified, verify it matches
+                        if [ -z "$hash_filename" ] || [ "$file_name" = "$hash_filename" ]; then
+                            is_match=true
+                            matched_hash="$file_hash1"
+                            hash_type="SHA1"
+                            break
+                        fi
+                    fi
+                done <<< "$known_hashes_sha1"
+            fi
+            
+            if [ "$is_match" = "true" ]; then
+                suspicious_count=$((suspicious_count + 1))
+                echo -e "  ${RED}[WARNING] Known malicious file hash detected: $file${NC}"
+                echo -e "    ${YELLOW}Hash ($hash_type): $matched_hash${NC}"
+                FOUND_IOCS+=("Known malicious hash ($hash_type) in $file")
+                WARNINGS=$((WARNINGS + 1))
+            fi
+        done < <(find "$PROJECT_ROOT" -name "$target_file" -type f ! -path "*/node_modules/.cache/*" -print0 2>/dev/null)
+    done
     
-    echo -e "  Checked $bundle_js_count bundle.js file(s)" -ForegroundColor $(if [ $suspicious_count -gt 0 ]; then echo "$YELLOW"; else echo "$GREEN"; fi)
+    local color="$GREEN"
+    if [ $suspicious_count -gt 0 ]; then
+        color="$YELLOW"
+    fi
+    echo -e "  Checked $total_files_checked file(s)" -ForegroundColor "$color"
     echo ""
 }
 
@@ -271,6 +385,10 @@ check_suspicious_packages() {
     
     local bundle_js_count=0
     local suspicious_count=0
+    
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "  ${GRAY}Scanning for bundle.js files...${NC}"
+    fi
     
     while IFS= read -r -d '' file; do
         bundle_js_count=$((bundle_js_count + 1))
@@ -295,20 +413,115 @@ check_suspicious_packages() {
         suspicious_package_patterns="shai-hulud|bundle|postinstall"
     fi
     
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "  ${GRAY}Using suspicious package patterns: $(echo "$suspicious_package_patterns" | tr '|' ', ')${NC}"
+    fi
+    
+    # Check package.json files
+    local package_json_count=0
+    local total_packages_checked=0
+    local suspicious_packages_found=0
+    
     while IFS= read -r -d '' file; do
+        package_json_count=$((package_json_count + 1))
+        
+        if [ "$VERBOSE" = "true" ]; then
+            echo -e "  ${GRAY}Checking: $file${NC}"
+        fi
+        
         if command -v jq >/dev/null 2>&1; then
             local deps=$(jq -r '.dependencies // {} | keys[]' "$file" 2>/dev/null)
             local dev_deps=$(jq -r '.devDependencies // {} | keys[]' "$file" 2>/dev/null)
             
+            local deps_count=0
+            local dev_deps_count=0
+            
+            for dep in $deps; do
+                deps_count=$((deps_count + 1))
+            done
+            
+            for dep in $dev_deps; do
+                dev_deps_count=$((dev_deps_count + 1))
+            done
+            
+            if [ "$VERBOSE" = "true" ]; then
+                echo -e "    ${GRAY}Found $deps_count dependency(ies), $dev_deps_count devDependency(ies)${NC}"
+            fi
+            
+            total_packages_checked=$((total_packages_checked + deps_count + dev_deps_count))
+            
             for dep in $deps $dev_deps; do
                 if echo "$dep" | grep -qiE "($suspicious_package_patterns)" && [ "$dep" != "postinstall" ]; then
+                    suspicious_packages_found=$((suspicious_packages_found + 1))
+                    local matched_pattern=$(echo "$dep" | grep -oiE "($suspicious_package_patterns)" | head -1)
                     echo -e "  ${YELLOW}[WARNING] Suspicious package name found: $dep in $file${NC}"
+                    echo -e "    ${YELLOW}Matched pattern: $matched_pattern${NC}"
                     FOUND_IOCS+=("Suspicious package: $dep in $file")
                     WARNINGS=$((WARNINGS + 1))
                 fi
             done
         fi
     done < <(find "$PROJECT_ROOT" -name "package.json" -type f -print0 2>/dev/null)
+    
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "  ${GRAY}Found $package_json_count package.json file(s) to check${NC}"
+    fi
+    
+    # Check package-lock.json files
+    local package_lock_count=0
+    
+    while IFS= read -r -d '' file; do
+        package_lock_count=$((package_lock_count + 1))
+        
+        if [ "$VERBOSE" = "true" ]; then
+            echo -e "  ${GRAY}Checking: $file${NC}"
+        fi
+        
+        if command -v jq >/dev/null 2>&1; then
+            # Try package-lock.json v2+ format first (packages field)
+            local lock_packages=$(jq -r '.packages // {} | keys[] | select(. != "")' "$file" 2>/dev/null)
+            
+            # If no packages field, try v1 format (dependencies)
+            if [ -z "$lock_packages" ]; then
+                # Extract all package names from nested dependencies structure
+                lock_packages=$(jq -r '.dependencies // {} | keys[]' "$file" 2>/dev/null)
+                # Also get nested dependencies recursively
+                local nested_deps=$(jq -r '.dependencies[]?.dependencies // {} | keys[]?' "$file" 2>/dev/null)
+                lock_packages=$(printf "%s\n%s" "$lock_packages" "$nested_deps" | sort -u)
+            fi
+            
+            local lock_packages_count=0
+            for pkg in $lock_packages; do
+                lock_packages_count=$((lock_packages_count + 1))
+            done
+            
+            if [ "$VERBOSE" = "true" ]; then
+                echo -e "    ${GRAY}Found $lock_packages_count package(s) in lock file${NC}"
+            fi
+            
+            total_packages_checked=$((total_packages_checked + lock_packages_count))
+            
+            for pkg in $lock_packages; do
+                # Remove path prefix if present (e.g., "node_modules/package-name" -> "package-name")
+                local pkg_name=$(echo "$pkg" | sed 's|^node_modules/||' | sed 's|.*node_modules/||')
+                
+                if echo "$pkg_name" | grep -qiE "($suspicious_package_patterns)" && [ "$pkg_name" != "postinstall" ]; then
+                    suspicious_packages_found=$((suspicious_packages_found + 1))
+                    local matched_pattern=$(echo "$pkg_name" | grep -oiE "($suspicious_package_patterns)" | head -1)
+                    echo -e "  ${YELLOW}[WARNING] Suspicious package name found in lock file: $pkg_name in $file${NC}"
+                    echo -e "    ${YELLOW}Matched pattern: $matched_pattern${NC}"
+                    FOUND_IOCS+=("Suspicious package in lock file: $pkg_name in $file")
+                    WARNINGS=$((WARNINGS + 1))
+                fi
+            done
+        fi
+    done < <(find "$PROJECT_ROOT" -name "package-lock.json" -type f -print0 2>/dev/null)
+    
+    if [ "$VERBOSE" = "true" ]; then
+        echo -e "  ${GRAY}Found $package_lock_count package-lock.json file(s) to check${NC}"
+        echo -e "  ${GRAY}Total packages checked: $total_packages_checked${NC}"
+        echo -e "  ${GRAY}Suspicious packages found: $suspicious_packages_found${NC}"
+    fi
     
     if [ $bundle_js_count -eq 0 ]; then
         echo -e "  ${GREEN}No bundle.js files found${NC}"
