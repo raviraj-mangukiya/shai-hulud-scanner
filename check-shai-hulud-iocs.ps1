@@ -68,6 +68,73 @@ $projectRoot = Resolve-Path $ProjectPath
 Write-Host "Scanning project: $projectRoot" -ForegroundColor Yellow
 Write-Host ""
 
+# Load compromised packages list from CSV
+$compromisedPackages = @()
+$compromisedPackagesCacheFile = Join-Path $scriptDir "ioc-cache\compromised-packages.json"
+$config = Get-Content $configFile -Raw | ConvertFrom-Json
+
+if ($config.compromised_packages_csv_url) {
+    try {
+        # Check if cache exists and is recent (within 24 hours)
+        $shouldDownload = $true
+        if (Test-Path $compromisedPackagesCacheFile) {
+            $cacheData = Get-Content $compromisedPackagesCacheFile -Raw | ConvertFrom-Json
+            $cacheTime = [DateTime]::Parse($cacheData.last_updated)
+            $hoursSinceUpdate = (Get-Date) - $cacheTime
+            if ($hoursSinceUpdate.TotalHours -lt 24) {
+                $shouldDownload = $false
+                $compromisedPackages = $cacheData.packages
+                if ($Verbose) {
+                    Write-Host "Loaded $($compromisedPackages.Count) compromised packages from cache" -ForegroundColor Gray
+                }
+            }
+        }
+        
+        if ($shouldDownload -and -not $SkipDownload) {
+            if ($Verbose) {
+                Write-Host "Downloading compromised packages list..." -ForegroundColor Gray
+            }
+            $csvContent = Invoke-WebRequest -Uri $config.compromised_packages_csv_url -UseBasicParsing | Select-Object -ExpandProperty Content
+            $lines = $csvContent -split "`n" | Where-Object { $_ -and $_ -notmatch "^Package," }
+            
+            foreach ($line in $lines) {
+                $packageName = ($line -split ",")[0].Trim()
+                if ($packageName -and $packageName -ne "Package") {
+                    $compromisedPackages += $packageName
+                }
+            }
+            
+            # Cache the results
+            $cacheDir = Split-Path $compromisedPackagesCacheFile -Parent
+            if (-not (Test-Path $cacheDir)) {
+                New-Item -ItemType Directory -Path $cacheDir | Out-Null
+            }
+            @{
+                packages = $compromisedPackages
+                last_updated = (Get-Date).ToString("o")
+            } | ConvertTo-Json | Set-Content $compromisedPackagesCacheFile
+            
+            if ($Verbose) {
+                Write-Host "Downloaded and cached $($compromisedPackages.Count) compromised packages" -ForegroundColor Gray
+            }
+        }
+    }
+    catch {
+        Write-Host "Warning: Could not download compromised packages list: $_" -ForegroundColor Yellow
+        # Try to load from cache as fallback
+        if (Test-Path $compromisedPackagesCacheFile) {
+            try {
+                $cacheData = Get-Content $compromisedPackagesCacheFile -Raw | ConvertFrom-Json
+                $compromisedPackages = $cacheData.packages
+                Write-Host "Loaded $($compromisedPackages.Count) compromised packages from cache (fallback)" -ForegroundColor Yellow
+            }
+            catch {
+                # Cache is corrupted, ignore
+            }
+        }
+    }
+}
+
 # Function to calculate SHA-256 hash
 function Get-FileHash256 {
     param([string]$FilePath)
@@ -503,12 +570,30 @@ function Check-SuspiciousPackages {
             $totalPackagesChecked += $allDeps.Count
             
             foreach ($dep in $allDeps) {
-                foreach ($pattern in $suspiciousPackagePatterns) {
-                    if ($dep -match $pattern -and $dep -ne "postinstall") {
-                        $suspiciousPackagesFound++
-                        Write-Host "  [WARNING] Suspicious package name found: $dep in $($file.FullName)" -ForegroundColor Yellow
-                        Write-Host "    Matched pattern: $pattern" -ForegroundColor Yellow
-                        $foundIOCs += "Suspicious package: $dep in $($file.FullName)"
+                $isSuspicious = $false
+                $matchReason = ""
+                
+                # Check against compromised packages list (exact match)
+                if ($compromisedPackages -contains $dep) {
+                    $isSuspicious = $true
+                    $matchReason = "Known compromised package (from Wiz Research CSV)"
+                    $suspiciousPackagesFound++
+                    Write-Host "  [WARNING] Known compromised package found: $dep in $($file.FullName)" -ForegroundColor Red
+                    Write-Host "    $matchReason" -ForegroundColor Yellow
+                    $foundIOCs += "Known compromised package: $dep in $($file.FullName)"
+                }
+                # Check against pattern matching (if not already flagged)
+                elseif ($dep -ne "postinstall") {
+                    foreach ($pattern in $suspiciousPackagePatterns) {
+                        if ($dep -match $pattern) {
+                            $isSuspicious = $true
+                            $matchReason = "Matched pattern: $pattern"
+                            $suspiciousPackagesFound++
+                            Write-Host "  [WARNING] Suspicious package name found: $dep in $($file.FullName)" -ForegroundColor Yellow
+                            Write-Host "    $matchReason" -ForegroundColor Yellow
+                            $foundIOCs += "Suspicious package: $dep in $($file.FullName)"
+                            break
+                        }
                     }
                 }
             }
@@ -565,12 +650,30 @@ function Check-SuspiciousPackages {
                 # Remove path prefix if present (e.g., "node_modules/package-name" -> "package-name")
                 $pkgName = $pkg -replace '^node_modules/', '' -replace '^.*node_modules/', ''
                 
-                foreach ($pattern in $suspiciousPackagePatterns) {
-                    if ($pkgName -match $pattern -and $pkgName -ne "postinstall") {
-                        $suspiciousPackagesFound++
-                        Write-Host "  [WARNING] Suspicious package name found in lock file: $pkgName in $($file.FullName)" -ForegroundColor Yellow
-                        Write-Host "    Matched pattern: $pattern" -ForegroundColor Yellow
-                        $foundIOCs += "Suspicious package in lock file: $pkgName in $($file.FullName)"
+                $isSuspicious = $false
+                $matchReason = ""
+                
+                # Check against compromised packages list (exact match)
+                if ($compromisedPackages -contains $pkgName) {
+                    $isSuspicious = $true
+                    $matchReason = "Known compromised package (from Wiz Research CSV)"
+                    $suspiciousPackagesFound++
+                    Write-Host "  [WARNING] Known compromised package found in lock file: $pkgName in $($file.FullName)" -ForegroundColor Red
+                    Write-Host "    $matchReason" -ForegroundColor Yellow
+                    $foundIOCs += "Known compromised package in lock file: $pkgName in $($file.FullName)"
+                }
+                # Check against pattern matching (if not already flagged)
+                elseif ($pkgName -ne "postinstall") {
+                    foreach ($pattern in $suspiciousPackagePatterns) {
+                        if ($pkgName -match $pattern) {
+                            $isSuspicious = $true
+                            $matchReason = "Matched pattern: $pattern"
+                            $suspiciousPackagesFound++
+                            Write-Host "  [WARNING] Suspicious package name found in lock file: $pkgName in $($file.FullName)" -ForegroundColor Yellow
+                            Write-Host "    $matchReason" -ForegroundColor Yellow
+                            $foundIOCs += "Suspicious package in lock file: $pkgName in $($file.FullName)"
+                            break
+                        }
                     }
                 }
             }

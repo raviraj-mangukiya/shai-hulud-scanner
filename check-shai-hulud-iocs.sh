@@ -68,6 +68,81 @@ PROJECT_ROOT=$(cd "$PROJECT_PATH" && pwd)
 echo -e "${YELLOW}Scanning project: $PROJECT_ROOT${NC}"
 echo ""
 
+# Load compromised packages list from CSV
+COMPROMISED_PACKAGES_CACHE_FILE="$SCRIPT_DIR/ioc-cache/compromised-packages.json"
+COMPROMISED_PACKAGES=()
+
+if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_FILE" ]; then
+    CSV_URL=$(jq -r '.compromised_packages_csv_url // empty' "$CONFIG_FILE")
+    
+    if [ -n "$CSV_URL" ]; then
+        # Check if cache exists and is recent (within 24 hours)
+        SHOULD_DOWNLOAD=true
+        if [ -f "$COMPROMISED_PACKAGES_CACHE_FILE" ]; then
+            CACHE_TIME=$(jq -r '.last_updated // empty' "$COMPROMISED_PACKAGES_CACHE_FILE")
+            if [ -n "$CACHE_TIME" ]; then
+                # Simple check: if cache file is less than 24 hours old
+                if [ "$(find "$COMPROMISED_PACKAGES_CACHE_FILE" -mtime -1 2>/dev/null)" ]; then
+                    SHOULD_DOWNLOAD=false
+                    COMPROMISED_PACKAGES=($(jq -r '.packages[]?' "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null))
+                    if [ "$VERBOSE" = "true" ]; then
+                        echo -e "  ${GRAY}Loaded ${#COMPROMISED_PACKAGES[@]} compromised packages from cache${NC}"
+                    fi
+                fi
+            fi
+        fi
+        
+        if [ "$SHOULD_DOWNLOAD" = "true" ] && [ "$SKIP_DOWNLOAD" != "true" ]; then
+            if [ "$VERBOSE" = "true" ]; then
+                echo -e "  ${GRAY}Downloading compromised packages list...${NC}"
+            fi
+            
+            if command -v curl >/dev/null 2>&1; then
+                CSV_CONTENT=$(curl -s "$CSV_URL" 2>/dev/null)
+            elif command -v wget >/dev/null 2>&1; then
+                CSV_CONTENT=$(wget -qO- "$CSV_URL" 2>/dev/null)
+            else
+                CSV_CONTENT=""
+            fi
+            
+            if [ -n "$CSV_CONTENT" ]; then
+                while IFS= read -r line; do
+                    if [ -n "$line" ] && ! echo "$line" | grep -q "^Package,"; then
+                        PACKAGE_NAME=$(echo "$line" | cut -d',' -f1 | tr -d ' ' | tr -d '"')
+                        if [ -n "$PACKAGE_NAME" ] && [ "$PACKAGE_NAME" != "Package" ]; then
+                            COMPROMISED_PACKAGES+=("$PACKAGE_NAME")
+                        fi
+                    fi
+                done <<< "$CSV_CONTENT"
+                
+                # Cache the results
+                mkdir -p "$(dirname "$COMPROMISED_PACKAGES_CACHE_FILE")"
+                jq -n \
+                    --argjson packages "$(printf '%s\n' "${COMPROMISED_PACKAGES[@]}" | jq -R . | jq -s .)" \
+                    --arg last_updated "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+                    '{packages: $packages, last_updated: $last_updated}' \
+                    > "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null || {
+                    # Fallback if jq fails
+                    echo "{\"packages\":[$(printf '"%s",' "${COMPROMISED_PACKAGES[@]}" | sed 's/,$//')],\"last_updated\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > "$COMPROMISED_PACKAGES_CACHE_FILE"
+                }
+                
+                if [ "$VERBOSE" = "true" ]; then
+                    echo -e "  ${GRAY}Downloaded and cached ${#COMPROMISED_PACKAGES[@]} compromised packages${NC}"
+                fi
+            else
+                echo -e "  ${YELLOW}Warning: Could not download compromised packages list${NC}"
+                # Try to load from cache as fallback
+                if [ -f "$COMPROMISED_PACKAGES_CACHE_FILE" ]; then
+                    COMPROMISED_PACKAGES=($(jq -r '.packages[]?' "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null))
+                    if [ ${#COMPROMISED_PACKAGES[@]} -gt 0 ]; then
+                        echo -e "  ${YELLOW}Loaded ${#COMPROMISED_PACKAGES[@]} compromised packages from cache (fallback)${NC}"
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
 # Function to calculate SHA-256 hash
 get_file_hash256() {
     local file_path="$1"
@@ -451,13 +526,35 @@ check_suspicious_packages() {
             total_packages_checked=$((total_packages_checked + deps_count + dev_deps_count))
             
             for dep in $deps $dev_deps; do
-                if echo "$dep" | grep -qiE "($suspicious_package_patterns)" && [ "$dep" != "postinstall" ]; then
-                    suspicious_packages_found=$((suspicious_packages_found + 1))
-                    local matched_pattern=$(echo "$dep" | grep -oiE "($suspicious_package_patterns)" | head -1)
-                    echo -e "  ${YELLOW}[WARNING] Suspicious package name found: $dep in $file${NC}"
-                    echo -e "    ${YELLOW}Matched pattern: $matched_pattern${NC}"
-                    FOUND_IOCS+=("Suspicious package: $dep in $file")
-                    WARNINGS=$((WARNINGS + 1))
+                local is_suspicious=false
+                local match_reason=""
+                
+                # Check against compromised packages list (exact match)
+                for compromised_pkg in "${COMPROMISED_PACKAGES[@]}"; do
+                    if [ "$dep" = "$compromised_pkg" ]; then
+                        is_suspicious=true
+                        match_reason="Known compromised package (from Wiz Research CSV)"
+                        suspicious_packages_found=$((suspicious_packages_found + 1))
+                        echo -e "  ${RED}[WARNING] Known compromised package found: $dep in $file${NC}"
+                        echo -e "    ${YELLOW}$match_reason${NC}"
+                        FOUND_IOCS+=("Known compromised package: $dep in $file")
+                        WARNINGS=$((WARNINGS + 1))
+                        break
+                    fi
+                done
+                
+                # Check against pattern matching (if not already flagged)
+                if [ "$is_suspicious" = "false" ] && [ "$dep" != "postinstall" ]; then
+                    if echo "$dep" | grep -qiE "($suspicious_package_patterns)"; then
+                        is_suspicious=true
+                        local matched_pattern=$(echo "$dep" | grep -oiE "($suspicious_package_patterns)" | head -1)
+                        match_reason="Matched pattern: $matched_pattern"
+                        suspicious_packages_found=$((suspicious_packages_found + 1))
+                        echo -e "  ${YELLOW}[WARNING] Suspicious package name found: $dep in $file${NC}"
+                        echo -e "    ${YELLOW}$match_reason${NC}"
+                        FOUND_IOCS+=("Suspicious package: $dep in $file")
+                        WARNINGS=$((WARNINGS + 1))
+                    fi
                 fi
             done
         fi
@@ -505,13 +602,35 @@ check_suspicious_packages() {
                 # Remove path prefix if present (e.g., "node_modules/package-name" -> "package-name")
                 local pkg_name=$(echo "$pkg" | sed 's|^node_modules/||' | sed 's|.*node_modules/||')
                 
-                if echo "$pkg_name" | grep -qiE "($suspicious_package_patterns)" && [ "$pkg_name" != "postinstall" ]; then
-                    suspicious_packages_found=$((suspicious_packages_found + 1))
-                    local matched_pattern=$(echo "$pkg_name" | grep -oiE "($suspicious_package_patterns)" | head -1)
-                    echo -e "  ${YELLOW}[WARNING] Suspicious package name found in lock file: $pkg_name in $file${NC}"
-                    echo -e "    ${YELLOW}Matched pattern: $matched_pattern${NC}"
-                    FOUND_IOCS+=("Suspicious package in lock file: $pkg_name in $file")
-                    WARNINGS=$((WARNINGS + 1))
+                local is_suspicious=false
+                local match_reason=""
+                
+                # Check against compromised packages list (exact match)
+                for compromised_pkg in "${COMPROMISED_PACKAGES[@]}"; do
+                    if [ "$pkg_name" = "$compromised_pkg" ]; then
+                        is_suspicious=true
+                        match_reason="Known compromised package (from Wiz Research CSV)"
+                        suspicious_packages_found=$((suspicious_packages_found + 1))
+                        echo -e "  ${RED}[WARNING] Known compromised package found in lock file: $pkg_name in $file${NC}"
+                        echo -e "    ${YELLOW}$match_reason${NC}"
+                        FOUND_IOCS+=("Known compromised package in lock file: $pkg_name in $file")
+                        WARNINGS=$((WARNINGS + 1))
+                        break
+                    fi
+                done
+                
+                # Check against pattern matching (if not already flagged)
+                if [ "$is_suspicious" = "false" ] && [ "$pkg_name" != "postinstall" ]; then
+                    if echo "$pkg_name" | grep -qiE "($suspicious_package_patterns)"; then
+                        is_suspicious=true
+                        local matched_pattern=$(echo "$pkg_name" | grep -oiE "($suspicious_package_patterns)" | head -1)
+                        match_reason="Matched pattern: $matched_pattern"
+                        suspicious_packages_found=$((suspicious_packages_found + 1))
+                        echo -e "  ${YELLOW}[WARNING] Suspicious package name found in lock file: $pkg_name in $file${NC}"
+                        echo -e "    ${YELLOW}$match_reason${NC}"
+                        FOUND_IOCS+=("Suspicious package in lock file: $pkg_name in $file")
+                        WARNINGS=$((WARNINGS + 1))
+                    fi
                 fi
             done
         fi
