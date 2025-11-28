@@ -75,6 +75,7 @@ A test project is included in `test/fakepanda/` with various IOCs for validation
 ## References
 
 - [Wiz Research: Shai-Hulud npm Supply Chain Attack](https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack)
+- [Wiz Research: Shai-Hulud 2.0 Ongoing Supply Chain Attack](https://www.wiz.io/blog/shai-hulud-2-0-ongoing-supply-chain-attack)
 - [Wiz Research IOCs](https://github.com/wiz-sec-public/wiz-research-iocs)
 
 ## License
