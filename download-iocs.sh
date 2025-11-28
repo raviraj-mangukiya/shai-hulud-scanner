@@ -25,65 +25,19 @@ NC='\033[0m'
 # Create cache directory if it doesn't exist
 mkdir -p "$IOC_CACHE_DIR"
 
-# JSON parsing helper functions (replacing jq)
-json_get_value() {
-    local json="$1"
-    local key="$2"
-    local default="${3:-}"
-    local value=$(echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed "s/\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\"/\1/" | head -1)
-    if [ -z "$value" ]; then
-        value=$(echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | sed "s/\"$key\"[[:space:]]*:[[:space:]]*\([0-9]*\)/\1/" | head -1)
-    fi
-    if [ -z "$value" ]; then
-        echo "$default"
-    else
-        echo "$value"
-    fi
-}
-
-json_get_object_value() {
-    local obj="$1"
-    local key="$2"
-    local default="${3:-}"
-    echo "$obj" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed "s/\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\"/\1/" | head -1 || echo "$default"
-}
-
-json_extract_sources() {
-    local json="$1"
-    # Extract ioc_sources array objects where enabled=true
-    echo "$json" | awk '
-    BEGIN { in_sources=0; in_obj=0; brace_count=0; obj_lines="" }
-    /"ioc_sources"[[:space:]]*:[[:space:]]*\[/ { in_sources=1; next }
-    in_sources && /\{/ { 
-        if (in_obj == 0) { in_obj=1; brace_count=1; obj_lines=$0; next }
-        brace_count++; obj_lines=obj_lines "\n" $0; next
-    }
-    in_obj && /\}/ { 
-        brace_count--; obj_lines=obj_lines "\n" $0
-        if (brace_count == 0) {
-            if (obj_lines ~ /"enabled"[[:space:]]*:[[:space:]]*true/) {
-                print obj_lines
-            }
-            in_obj=0; obj_lines=""
-        }
-        next
-    }
-    in_obj { obj_lines=obj_lines "\n" $0; next }
-    in_sources && /\]/ { in_sources=0; next }
-    '
-}
-
-json_is_valid() {
-    local json="$1"
-    # Basic validation: check if it starts with { or [ and has balanced braces
-    if echo "$json" | grep -qE '^[[:space:]]*[\{\[]'; then
-        local open=$(echo "$json" | tr -cd '{[' | wc -c)
-        local close=$(echo "$json" | tr -cd '}]' | wc -c)
-        [ "$open" -eq "$close" ]
-    else
-        return 1
-    fi
-}
+# Check if jq is available
+if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${RED}Error: jq is required but not installed.${NC}"
+    echo ""
+    echo "Installation options:"
+    echo "  - Debian/Ubuntu: sudo apt-get install jq"
+    echo "  - macOS: brew install jq"
+    echo "  - Windows: Use the PowerShell script instead: download-iocs.ps1"
+    echo ""
+    echo "The bash script requires jq for JSON parsing. On Windows, PowerShell scripts"
+    echo "are recommended as they don't require additional dependencies."
+    exit 1
+fi
 
 # Check if curl or wget is available
 if command -v curl >/dev/null 2>&1; then
@@ -105,8 +59,7 @@ fi
 NEEDS_UPDATE="$FORCE"
 if [ "$NEEDS_UPDATE" != "true" ] && [ -f "$LAST_UPDATE_FILE" ]; then
     LAST_UPDATE=$(cat "$LAST_UPDATE_FILE")
-    CONFIG_CONTENT=$(cat "$CONFIG_FILE")
-    UPDATE_INTERVAL_HOURS=$(json_get_value "$CONFIG_CONTENT" "update_interval_hours" "24")
+    UPDATE_INTERVAL_HOURS=$(jq -r '.update_interval_hours // 24' "$CONFIG_FILE")
     
     if command -v date >/dev/null 2>&1; then
         LAST_UPDATE_EPOCH=$(date -d "$LAST_UPDATE" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$LAST_UPDATE" +%s 2>/dev/null || echo "0")
@@ -128,23 +81,18 @@ echo -e "${CYAN}Downloading latest Shai-Hulud IOCs...${NC}"
 echo ""
 
 # Initialize IOCs structure with local patterns
-ALL_IOCS=$(cat "$CONFIG_FILE")
-CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-# Add sources array and metadata to the JSON
-ALL_IOCS=$(echo "$ALL_IOCS" | sed 's/}$/,\n  "sources": [],\n  "last_updated": "'"$CURRENT_TIME"'",\n  "version": "1.0"\n}/')
+ALL_IOCS=$(jq '.' "$CONFIG_FILE")
+ALL_IOCS=$(echo "$ALL_IOCS" | jq '. + {
+    sources: [],
+    last_updated: (now | strftime("%Y-%m-%d %H:%M:%S")),
+    version: "1.0"
+}')
 
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 
-# Get enabled sources - extract ioc_sources array and filter for enabled=true
-CONFIG_CONTENT=$(cat "$CONFIG_FILE")
-SOURCES=""
-IFS=$'\n'
-for source_obj in $(echo "$CONFIG_CONTENT" | awk '/"ioc_sources"[[:space:]]*:[[:space:]]*\[/,/\]/ { if (!/\[|\]/) print }' | awk '/\{/,/\}/ { print }'); do
-    if echo "$source_obj" | grep -q '"enabled"[[:space:]]*:[[:space:]]*true'; then
-        SOURCES="${SOURCES}${source_obj}"$'\n'
-    fi
-done
+# Get enabled sources
+SOURCES=$(echo "$ALL_IOCS" | jq -c '.ioc_sources[] | select(.enabled == true)')
 
 while IFS= read -r source; do
     SOURCE_NAME=$(echo "$source" | jq -r '.name')
