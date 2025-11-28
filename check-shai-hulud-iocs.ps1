@@ -1,0 +1,429 @@
+# Shai-Hulud IOC Detection Script
+# Based on Wiz Research findings
+# This script downloads the latest IOCs and checks for Indicators of Compromise (IOCs)
+
+param(
+    [string]$ProjectPath = "..",
+    [switch]$Verbose,
+    [switch]$SkipDownload
+)
+
+$ErrorActionPreference = "Continue"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$configFile = Join-Path $scriptDir "config.json"
+$iocCacheFile = Join-Path $scriptDir "ioc-cache\iocs.json"
+$downloadScript = Join-Path $scriptDir "download-iocs.ps1"
+
+# Download latest IOCs first
+if (-not $SkipDownload) {
+    Write-Host "Updating IOCs..." -ForegroundColor Cyan
+    & $downloadScript -ConfigPath "config.json"
+    Write-Host ""
+}
+
+# Load IOCs from cache
+$iocs = $null
+if (Test-Path $iocCacheFile) {
+    try {
+        $iocs = Get-Content $iocCacheFile -Raw | ConvertFrom-Json
+        Write-Host "Loaded IOCs from cache (last updated: $($iocs.last_updated))" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Warning: Could not load IOC cache. Using default patterns." -ForegroundColor Yellow
+    }
+}
+
+# Fallback to config if cache is not available
+if (-not $iocs) {
+    if (Test-Path $configFile) {
+        $config = Get-Content $configFile -Raw | ConvertFrom-Json
+        $iocs = @{
+            patterns = $config.ioc_patterns
+            last_updated = "local config"
+        }
+        Write-Host "Using IOCs from local config" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Error: No IOC data available. Please run download-iocs.ps1 first." -ForegroundColor Red
+        exit 1
+    }
+}
+
+$foundIOCs = @()
+$scanResults = @{
+    PostinstallScripts = @()
+    BundleJsInTarballs = @()
+    SuspiciousWorkflows = @()
+    SuspiciousPackages = @()
+    FileHashes = @()
+}
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Shai-Hulud IOC Scanner" -ForegroundColor Cyan
+Write-Host "Based on Wiz Research" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+$projectRoot = Resolve-Path $ProjectPath
+Write-Host "Scanning project: $projectRoot" -ForegroundColor Yellow
+Write-Host ""
+
+# Function to calculate SHA-256 hash
+function Get-FileHash256 {
+    param([string]$FilePath)
+    try {
+        $hash = Get-FileHash -Path $FilePath -Algorithm SHA256 -ErrorAction Stop
+        return $hash.Hash.ToLower()
+    }
+    catch {
+        return $null
+    }
+}
+
+# Function to check for postinstall scripts in package.json files
+function Check-PostinstallScripts {
+    Write-Host "[1/5] Checking for malicious 'postinstall' scripts in package.json files..." -ForegroundColor Green
+    
+    $packageJsonFiles = Get-ChildItem -Path $projectRoot -Filter "package.json" -Recurse -ErrorAction SilentlyContinue
+    
+    $patterns = $iocs.patterns.postinstall_patterns
+    if (-not $patterns) {
+        $patterns = @("bundle\.js", "toJSON\(secrets\)", "eval\(", "require\(.*process", "child_process", "exec\(", "spawn\(")
+    }
+    
+    foreach ($file in $packageJsonFiles) {
+        try {
+            $content = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            
+            if ($content.scripts -and $content.scripts.postinstall) {
+                $postinstallScript = $content.scripts.postinstall
+                
+                $isSuspicious = $false
+                $matchedPatterns = @()
+                
+                foreach ($pattern in $patterns) {
+                    if ($postinstallScript -match $pattern) {
+                        $isSuspicious = $true
+                        $matchedPatterns += $pattern
+                    }
+                }
+                
+                $result = @{
+                    File = $file.FullName
+                    Script = $postinstallScript
+                    IsSuspicious = $isSuspicious
+                    MatchedPatterns = $matchedPatterns
+                }
+                
+                $scanResults.PostinstallScripts += $result
+                
+                if ($isSuspicious) {
+                    Write-Host "  [WARNING] Suspicious postinstall script found in: $($file.FullName)" -ForegroundColor Red
+                    Write-Host "    Script: $postinstallScript" -ForegroundColor Yellow
+                    Write-Host "    Matched patterns: $($matchedPatterns -join ', ')" -ForegroundColor Yellow
+                    $foundIOCs += "Suspicious postinstall script in $($file.FullName)"
+                } elseif ($Verbose) {
+                    Write-Host "  [INFO] Postinstall script found in: $($file.FullName)" -ForegroundColor Gray
+                    Write-Host "    Script: $postinstallScript" -ForegroundColor Gray
+                }
+            }
+        }
+        catch {
+            if ($Verbose) {
+                Write-Host "  [INFO] Could not parse package.json: $($file.FullName)" -ForegroundColor Gray
+            }
+        }
+    }
+    
+    Write-Host "  Found $($scanResults.PostinstallScripts.Count) package.json files with postinstall scripts" -ForegroundColor $(if ($scanResults.PostinstallScripts.Count -gt 0) { "Yellow" } else { "Green" })
+    Write-Host ""
+}
+
+# Function to check for bundle.js in tarballs
+function Check-BundleJsInTarballs {
+    Write-Host "[2/5] Checking for 'bundle.js' in npm tarball files (.tgz)..." -ForegroundColor Green
+    
+    $tarballFiles = Get-ChildItem -Path $projectRoot -Filter "*.tgz" -Recurse -ErrorAction SilentlyContinue
+    
+    foreach ($tarball in $tarballFiles) {
+        try {
+            $tarAvailable = Get-Command tar -ErrorAction SilentlyContinue
+            
+            if ($tarAvailable) {
+                $contents = tar -tf $tarball.FullName 2>$null
+                if ($contents -match "bundle\.js") {
+                    $result = @{
+                        File = $tarball.FullName
+                        ContainsBundleJs = $true
+                    }
+                    $scanResults.BundleJsInTarballs += $result
+                    Write-Host "  [WARNING] Found bundle.js in tarball: $($tarball.FullName)" -ForegroundColor Red
+                    $foundIOCs += "bundle.js found in tarball $($tarball.FullName)"
+                }
+            } else {
+                $7zipAvailable = Get-Command 7z -ErrorAction SilentlyContinue
+                if ($7zipAvailable) {
+                    $contents = 7z l $tarball.FullName 2>$null
+                    if ($contents -match "bundle\.js") {
+                        $result = @{
+                            File = $tarball.FullName
+                            ContainsBundleJs = $true
+                        }
+                        $scanResults.BundleJsInTarballs += $result
+                        Write-Host "  [WARNING] Found bundle.js in tarball: $($tarball.FullName)" -ForegroundColor Red
+                        $foundIOCs += "bundle.js found in tarball $($tarball.FullName)"
+                    }
+                } else {
+                    if ($Verbose) {
+                        Write-Host "  [INFO] Cannot check tarball contents (tar or 7zip not available): $($tarball.FullName)" -ForegroundColor Gray
+                    }
+                }
+            }
+        }
+        catch {
+            if ($Verbose) {
+                Write-Host "  [INFO] Error checking tarball: $($tarball.FullName)" -ForegroundColor Gray
+            }
+        }
+    }
+    
+    if ($tarballFiles.Count -eq 0) {
+        Write-Host "  No .tgz files found" -ForegroundColor Green
+    } else {
+        Write-Host "  Checked $($tarballFiles.Count) tarball file(s)" -ForegroundColor $(if ($scanResults.BundleJsInTarballs.Count -gt 0) { "Yellow" } else { "Green" })
+    }
+    Write-Host ""
+}
+
+# Function to check for suspicious GitHub workflows
+function Check-SuspiciousWorkflows {
+    Write-Host "[3/5] Checking for suspicious GitHub workflows..." -ForegroundColor Green
+    
+    $workflowDirs = @(
+        Join-Path $projectRoot ".github\workflows",
+        Join-Path $projectRoot ".github"
+    )
+    
+    $workflowFiles = @()
+    foreach ($dir in $workflowDirs) {
+        if (Test-Path $dir) {
+            $workflowFiles += Get-ChildItem -Path $dir -Filter "*.yml" -Recurse -ErrorAction SilentlyContinue
+            $workflowFiles += Get-ChildItem -Path $dir -Filter "*.yaml" -Recurse -ErrorAction SilentlyContinue
+        }
+    }
+    
+    $patterns = $iocs.patterns.suspicious_workflow_patterns
+    if (-not $patterns) {
+        $patterns = @("toJSON\(secrets\)", "shai-hulud", "shai-hulud-workflow")
+    }
+    
+    $suspiciousWorkflowFiles = $iocs.patterns.suspicious_workflow_files
+    if (-not $suspiciousWorkflowFiles) {
+        $suspiciousWorkflowFiles = @("shai-hulud.yaml", "shai-hulud-workflow.yml")
+    }
+    
+    foreach ($file in $workflowFiles) {
+        try {
+            $content = Get-Content $file.FullName -Raw
+            $fileName = Split-Path -Leaf $file.FullName
+            $isSuspicious = $false
+            $matchedPatterns = @()
+            
+            # Check filename
+            foreach ($suspiciousName in $suspiciousWorkflowFiles) {
+                if ($fileName -match $suspiciousName) {
+                    $isSuspicious = $true
+                    $matchedPatterns += "suspicious filename: $suspiciousName"
+                }
+            }
+            
+            # Check content patterns
+            foreach ($pattern in $patterns) {
+                if ($content -match $pattern) {
+                    $isSuspicious = $true
+                    $matchedPatterns += $pattern
+                }
+            }
+            
+            if ($isSuspicious) {
+                $result = @{
+                    File = $file.FullName
+                    MatchedPatterns = $matchedPatterns
+                }
+                $scanResults.SuspiciousWorkflows += $result
+                Write-Host "  [WARNING] Suspicious workflow found: $($file.FullName)" -ForegroundColor Red
+                Write-Host "    Matched: $($matchedPatterns -join ', ')" -ForegroundColor Yellow
+                $foundIOCs += "Suspicious workflow in $($file.FullName)"
+                
+                if ($Verbose) {
+                    $lines = Get-Content $file.FullName
+                    for ($i = 0; $i -lt $lines.Count; $i++) {
+                        foreach ($pattern in $patterns) {
+                            if ($lines[$i] -match $pattern) {
+                                $start = [Math]::Max(0, $i - 2)
+                                $end = [Math]::Min($lines.Count - 1, $i + 2)
+                                Write-Host "    Context:" -ForegroundColor Gray
+                                for ($j = $start; $j -le $end; $j++) {
+                                    $marker = if ($j -eq $i) { ">>> " } else { "    " }
+                                    Write-Host "    $marker$($lines[$j])" -ForegroundColor Gray
+                                }
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            if ($Verbose) {
+                Write-Host "  [INFO] Error reading workflow file: $($file.FullName)" -ForegroundColor Gray
+            }
+        }
+    }
+    
+    if ($workflowFiles.Count -eq 0) {
+        Write-Host "  No GitHub workflow files found" -ForegroundColor Green
+    } else {
+        Write-Host "  Checked $($workflowFiles.Count) workflow file(s)" -ForegroundColor $(if ($scanResults.SuspiciousWorkflows.Count -gt 0) { "Yellow" } else { "Green" })
+    }
+    Write-Host ""
+}
+
+# Function to check file hashes
+function Check-FileHashes {
+    Write-Host "[4/5] Checking for known malicious file hashes..." -ForegroundColor Green
+    
+    $knownHashes = $iocs.patterns.known_hashes
+    if (-not $knownHashes -or $knownHashes.Count -eq 0) {
+        Write-Host "  No known hashes configured" -ForegroundColor Gray
+        Write-Host ""
+        return
+    }
+    
+    # Check bundle.js files
+    $bundleJsFiles = Get-ChildItem -Path $projectRoot -Filter "bundle.js" -Recurse -ErrorAction SilentlyContinue | 
+        Where-Object { $_.FullName -notmatch "node_modules[\\/]\.cache" }
+    
+    foreach ($file in $bundleJsFiles) {
+        $fileHash = Get-FileHash256 -FilePath $file.FullName
+        if ($fileHash -and $knownHashes -contains $fileHash) {
+            $result = @{
+                File = $file.FullName
+                Hash = $fileHash
+                IsKnownMalicious = $true
+            }
+            $scanResults.FileHashes += $result
+            Write-Host "  [WARNING] Known malicious file hash detected: $($file.FullName)" -ForegroundColor Red
+            Write-Host "    Hash: $fileHash" -ForegroundColor Yellow
+            $foundIOCs += "Known malicious hash in $($file.FullName)"
+        }
+    }
+    
+    Write-Host "  Checked $($bundleJsFiles.Count) bundle.js file(s)" -ForegroundColor $(if ($scanResults.FileHashes.Count -gt 0) { "Yellow" } else { "Green" })
+    Write-Host ""
+}
+
+# Function to check for suspicious npm packages
+function Check-SuspiciousPackages {
+    Write-Host "[5/5] Checking for suspicious npm packages and bundle.js files..." -ForegroundColor Green
+    
+    $bundleJsFiles = Get-ChildItem -Path $projectRoot -Filter "bundle.js" -Recurse -ErrorAction SilentlyContinue | 
+        Where-Object { $_.FullName -notmatch "node_modules[\\/]\.cache" }
+    
+    foreach ($file in $bundleJsFiles) {
+        $result = @{
+            File = $file.FullName
+            IsSuspicious = $true
+        }
+        $scanResults.SuspiciousPackages += $result
+        
+        $fileSize = (Get-Item $file.FullName).Length
+        if ($fileSize -lt 1000) {
+            Write-Host "  [WARNING] Small bundle.js file found: $($file.FullName) ($fileSize bytes)" -ForegroundColor Red
+            $foundIOCs += "Suspicious bundle.js file: $($file.FullName)"
+        } elseif ($Verbose) {
+            Write-Host "  [INFO] bundle.js file found: $($file.FullName) ($fileSize bytes)" -ForegroundColor Gray
+        }
+    }
+    
+    $packageJsonFiles = Get-ChildItem -Path $projectRoot -Filter "package.json" -Recurse -ErrorAction SilentlyContinue
+    
+    $suspiciousPackagePatterns = $iocs.patterns.suspicious_packages
+    if (-not $suspiciousPackagePatterns) {
+        $suspiciousPackagePatterns = @("shai-hulud", "bundle", "postinstall")
+    }
+    
+    foreach ($file in $packageJsonFiles) {
+        try {
+            $content = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            
+            $allDeps = @()
+            if ($content.dependencies) { $allDeps += $content.dependencies.PSObject.Properties.Name }
+            if ($content.devDependencies) { $allDeps += $content.devDependencies.PSObject.Properties.Name }
+            
+            foreach ($dep in $allDeps) {
+                foreach ($pattern in $suspiciousPackagePatterns) {
+                    if ($dep -match $pattern -and $dep -ne "postinstall") {
+                        Write-Host "  [WARNING] Suspicious package name found: $dep in $($file.FullName)" -ForegroundColor Yellow
+                        $foundIOCs += "Suspicious package: $dep in $($file.FullName)"
+                    }
+                }
+            }
+        }
+        catch {
+            # Ignore parse errors
+        }
+    }
+    
+    if ($bundleJsFiles.Count -eq 0) {
+        Write-Host "  No bundle.js files found" -ForegroundColor Green
+    } else {
+        Write-Host "  Found $($bundleJsFiles.Count) bundle.js file(s)" -ForegroundColor $(if ($scanResults.SuspiciousPackages.Count -gt 0) { "Yellow" } else { "Green" })
+    }
+    Write-Host ""
+}
+
+# Run all checks
+Check-PostinstallScripts
+Check-BundleJsInTarballs
+Check-SuspiciousWorkflows
+Check-FileHashes
+Check-SuspiciousPackages
+
+# Summary
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Scan Summary" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+$totalWarnings = $scanResults.PostinstallScripts | Where-Object { $_.IsSuspicious } | Measure-Object | Select-Object -ExpandProperty Count
+$totalWarnings += $scanResults.BundleJsInTarballs.Count
+$totalWarnings += $scanResults.SuspiciousWorkflows.Count
+$totalWarnings += $scanResults.FileHashes.Count
+$totalWarnings += ($scanResults.SuspiciousPackages | Where-Object { $_.IsSuspicious } | Measure-Object | Select-Object -ExpandProperty Count)
+
+if ($totalWarnings -eq 0) {
+    Write-Host "✓ No Shai-Hulud IOCs detected" -ForegroundColor Green
+    Write-Host ""
+    exit 0
+} else {
+    Write-Host "⚠ Found $totalWarnings potential IOC(s):" -ForegroundColor Red
+    Write-Host ""
+    
+    foreach ($ioc in $foundIOCs) {
+        Write-Host "  - $ioc" -ForegroundColor Yellow
+    }
+    
+    Write-Host ""
+    Write-Host "RECOMMENDED ACTIONS:" -ForegroundColor Cyan
+    Write-Host "  1. Review all flagged files manually" -ForegroundColor White
+    Write-Host "  2. Check npm account for unauthorized package publications" -ForegroundColor White
+    Write-Host "  3. Review GitHub Actions workflows for unauthorized changes" -ForegroundColor White
+    Write-Host "  4. Rotate all potentially compromised credentials:" -ForegroundColor White
+    Write-Host "     - npm tokens" -ForegroundColor White
+    Write-Host "     - GitHub Personal Access Tokens" -ForegroundColor White
+    Write-Host "     - API keys for cloud services" -ForegroundColor White
+    Write-Host "  5. Check for unauthorized Shai-Hulud repositories on GitHub" -ForegroundColor White
+    Write-Host ""
+    exit 1
+}

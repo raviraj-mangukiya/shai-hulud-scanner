@@ -1,0 +1,47 @@
+{
+  "ioc_sources": [
+    {
+      "name": "Wiz Research",
+      "url": "https://raw.githubusercontent.com/wiz-sec/shai-hulud-iocs/main/iocs.json",
+      "fallback_url": "https://gist.githubusercontent.com/wiz-research/shai-hulud-iocs/main/iocs.json",
+      "enabled": true
+    }
+  ],
+  "update_interval_hours": 24,
+  "ioc_patterns": {
+    "postinstall_patterns": [
+      "bundle\\.js",
+      "toJSON\\(secrets\\)",
+      "eval\\(",
+      "require\\(.*process",
+      "child_process",
+      "exec\\(",
+      "spawn\\("
+    ],
+    "suspicious_packages": [
+      "shai-hulud",
+      "bundle",
+      "postinstall"
+    ],
+    "suspicious_workflow_patterns": [
+      "toJSON\\(secrets\\)",
+      "shai-hulud",
+      "shai-hulud-workflow"
+    ],
+    "known_hashes": [
+      "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09"
+    ],
+    "exfiltration_endpoints": [
+      "webhook\\.site",
+      "bb8ca5f6-4175-45d2-b042-fc9ebb8170b7"
+    ],
+    "suspicious_repositories": [
+      "Shai-Hulud",
+      "Shai-Hulud Migration"
+    ],
+    "suspicious_workflow_files": [
+      "shai-hulud.yaml",
+      "shai-hulud-workflow.yml"
+    ]
+  }
+}
