@@ -26,6 +26,53 @@ CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 NC='\033[0m'
 
+# JSON parsing helper functions (replacing jq)
+json_get_value() {
+    local json="$1"
+    local key="$2"
+    local default="${3:-}"
+    local value=$(echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed "s/\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\"/\1/" | head -1)
+    if [ -z "$value" ]; then
+        value=$(echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | sed "s/\"$key\"[[:space:]]*:[[:space:]]*\([0-9]*\)/\1/" | head -1)
+    fi
+    if [ -z "$value" ]; then
+        echo "$default"
+    else
+        echo "$value"
+    fi
+}
+
+json_get_array_values() {
+    local json="$1"
+    local key="$2"
+    echo "$json" | awk -v key="$key" 'BEGIN { in_array=0 }
+        /"'"$key"'"[[:space:]]*:[[:space:]]*\[/ { in_array=1; next }
+        in_array && /\]/ { in_array=0; exit }
+        in_array && /"[^"]*"/ { gsub(/^[[:space:]]*"|"[[:space:]]*,?[[:space:]]*$/, ""); print }
+    '
+}
+
+json_extract_patterns() {
+    local json="$1"
+    local pattern_key="$2"
+    echo "$json" | awk -v pk="$pattern_key" 'BEGIN { in_patterns=0; in_key=0; bracket_count=0 }
+        /"patterns"[[:space:]]*:[[:space:]]*\{/ { in_patterns=1; next }
+        in_patterns && /"'"$pattern_key"'"[[:space:]]*:[[:space:]]*\[/ { 
+            in_key=1; bracket_count=1; next 
+        }
+        in_key && /\[/ { bracket_count++; next }
+        in_key && /\]/ { 
+            bracket_count--
+            if (bracket_count == 0) { in_key=0; in_patterns=0; exit }
+            next
+        }
+        in_key && /"[^"]*"/ { 
+            gsub(/^[[:space:]]*"|"[[:space:]]*,?[[:space:]]*$/, "")
+            print
+        }
+    '
+}
+
 # Download latest IOCs first
 if [ "$SKIP_DOWNLOAD" != "true" ]; then
     echo -e "${CYAN}Updating IOCs...${NC}"
@@ -36,21 +83,18 @@ fi
 # Load IOCs from cache
 IOCS=""
 if [ -f "$IOC_CACHE_FILE" ]; then
-    if command -v jq >/dev/null 2>&1; then
-        IOCS=$(cat "$IOC_CACHE_FILE")
-        LAST_UPDATED=$(echo "$IOCS" | jq -r '.last_updated // "unknown"')
-        echo -e "${GREEN}Loaded IOCs from cache (last updated: $LAST_UPDATED)${NC}"
-    else
-        echo -e "${YELLOW}Warning: jq not available. Using default patterns.${NC}"
-    fi
+    IOCS=$(cat "$IOC_CACHE_FILE")
+    LAST_UPDATED=$(json_get_value "$IOCS" "last_updated" "unknown")
+    echo -e "${GREEN}Loaded IOCs from cache (last updated: $LAST_UPDATED)${NC}"
 fi
 
 # Fallback to config if cache is not available
 if [ -z "$IOCS" ] && [ -f "$CONFIG_FILE" ]; then
-    if command -v jq >/dev/null 2>&1; then
-        IOCS=$(jq '{patterns: .ioc_patterns, last_updated: "local config"}' "$CONFIG_FILE")
-        echo -e "${YELLOW}Using IOCs from local config${NC}"
-    fi
+    CONFIG_CONTENT=$(cat "$CONFIG_FILE")
+    # Extract ioc_patterns and create a simple structure
+    IOC_PATTERNS=$(echo "$CONFIG_CONTENT" | awk '/"ioc_patterns"[[:space:]]*:[[:space:]]*\{/,/\}/')
+    IOCS="{\"patterns\":$IOC_PATTERNS,\"last_updated\":\"local config\"}"
+    echo -e "${YELLOW}Using IOCs from local config${NC}"
 fi
 
 if [ -z "$IOCS" ]; then
@@ -72,19 +116,21 @@ echo ""
 COMPROMISED_PACKAGES_CACHE_FILE="$SCRIPT_DIR/ioc-cache/compromised-packages.json"
 COMPROMISED_PACKAGES=()
 
-if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_FILE" ]; then
-    CSV_URL=$(jq -r '.compromised_packages_csv_url // empty' "$CONFIG_FILE")
+if [ -f "$CONFIG_FILE" ]; then
+    CONFIG_CONTENT=$(cat "$CONFIG_FILE")
+    CSV_URL=$(json_get_value "$CONFIG_CONTENT" "compromised_packages_csv_url")
     
     if [ -n "$CSV_URL" ]; then
         # Check if cache exists and is recent (within 24 hours)
         SHOULD_DOWNLOAD=true
         if [ -f "$COMPROMISED_PACKAGES_CACHE_FILE" ]; then
-            CACHE_TIME=$(jq -r '.last_updated // empty' "$COMPROMISED_PACKAGES_CACHE_FILE")
+            CACHE_CONTENT=$(cat "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null)
+            CACHE_TIME=$(json_get_value "$CACHE_CONTENT" "last_updated")
             if [ -n "$CACHE_TIME" ]; then
                 # Simple check: if cache file is less than 24 hours old
                 if [ "$(find "$COMPROMISED_PACKAGES_CACHE_FILE" -mtime -1 2>/dev/null)" ]; then
                     SHOULD_DOWNLOAD=false
-                    COMPROMISED_PACKAGES=($(jq -r '.packages[]?' "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null))
+                    COMPROMISED_PACKAGES=($(json_get_array_values "$CACHE_CONTENT" "packages"))
                     if [ "$VERBOSE" = "true" ]; then
                         echo -e "  ${GRAY}Loaded ${#COMPROMISED_PACKAGES[@]} compromised packages from cache${NC}"
                     fi
@@ -117,14 +163,9 @@ if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_FILE" ]; then
                 
                 # Cache the results
                 mkdir -p "$(dirname "$COMPROMISED_PACKAGES_CACHE_FILE")"
-                jq -n \
-                    --argjson packages "$(printf '%s\n' "${COMPROMISED_PACKAGES[@]}" | jq -R . | jq -s .)" \
-                    --arg last_updated "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-                    '{packages: $packages, last_updated: $last_updated}' \
-                    > "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null || {
-                    # Fallback if jq fails
-                    echo "{\"packages\":[$(printf '"%s",' "${COMPROMISED_PACKAGES[@]}" | sed 's/,$//')],\"last_updated\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > "$COMPROMISED_PACKAGES_CACHE_FILE"
-                }
+                LAST_UPDATED_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                PACKAGES_JSON=$(printf '"%s",' "${COMPROMISED_PACKAGES[@]}" | sed 's/,$//')
+                echo "{\"packages\":[$PACKAGES_JSON],\"last_updated\":\"$LAST_UPDATED_UTC\"}" > "$COMPROMISED_PACKAGES_CACHE_FILE"
                 
                 if [ "$VERBOSE" = "true" ]; then
                     echo -e "  ${GRAY}Downloaded and cached ${#COMPROMISED_PACKAGES[@]} compromised packages${NC}"
@@ -133,7 +174,8 @@ if command -v jq >/dev/null 2>&1 && [ -f "$CONFIG_FILE" ]; then
                 echo -e "  ${YELLOW}Warning: Could not download compromised packages list${NC}"
                 # Try to load from cache as fallback
                 if [ -f "$COMPROMISED_PACKAGES_CACHE_FILE" ]; then
-                    COMPROMISED_PACKAGES=($(jq -r '.packages[]?' "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null))
+                    CACHE_CONTENT=$(cat "$COMPROMISED_PACKAGES_CACHE_FILE" 2>/dev/null)
+                    COMPROMISED_PACKAGES=($(json_get_array_values "$CACHE_CONTENT" "packages"))
                     if [ ${#COMPROMISED_PACKAGES[@]} -gt 0 ]; then
                         echo -e "  ${YELLOW}Loaded ${#COMPROMISED_PACKAGES[@]} compromised packages from cache (fallback)${NC}"
                     fi
@@ -172,9 +214,7 @@ check_postinstall_scripts() {
     echo -e "${GREEN}[1/5] Checking for malicious 'postinstall' scripts in package.json files...${NC}"
     
     local patterns
-    if command -v jq >/dev/null 2>&1; then
-        patterns=$(echo "$IOCS" | jq -r '.patterns.postinstall_patterns[]? // empty' | tr '\n' '|' | sed 's/|$//')
-    fi
+    patterns=$(json_extract_patterns "$IOCS" "postinstall_patterns" | tr '\n' '|' | sed 's/|$//')
     
     if [ -z "$patterns" ]; then
         patterns="bundle\.js|toJSON\(secrets\)|eval\(|require\(.*process|child_process|exec\(|spawn\("
@@ -186,9 +226,13 @@ check_postinstall_scripts() {
     while IFS= read -r -d '' file; do
         count=$((count + 1))
         
-        if command -v jq >/dev/null 2>&1; then
-            if jq -e '.scripts.postinstall' "$file" >/dev/null 2>&1; then
-                local postinstall_script=$(jq -r '.scripts.postinstall' "$file")
+        # Check if postinstall script exists
+        if grep -q '"postinstall"' "$file"; then
+            local postinstall_script=$(grep -A 1 '"postinstall"' "$file" | grep -o '"[^"]*"' | head -1 | sed 's/"//g')
+            # Try to get the full postinstall value (handles multi-line)
+            if [ -z "$postinstall_script" ] || [ "$postinstall_script" = "postinstall" ]; then
+                postinstall_script=$(awk '/"postinstall"[[:space:]]*:/ {getline; gsub(/^[[:space:]]*"|",?[[:space:]]*$/, ""); print; exit}' "$file")
+            fi
                 
                 if echo "$postinstall_script" | grep -qE "($patterns)"; then
                     suspicious_count=$((suspicious_count + 1))
@@ -252,10 +296,8 @@ check_suspicious_workflows() {
     
     local patterns
     local suspicious_workflow_files
-    if command -v jq >/dev/null 2>&1; then
-        patterns=$(echo "$IOCS" | jq -r '.patterns.suspicious_workflow_patterns[]? // empty' | tr '\n' '|' | sed 's/|$//')
-        suspicious_workflow_files=$(echo "$IOCS" | jq -r '.patterns.suspicious_workflow_files[]? // empty')
-    fi
+    patterns=$(json_extract_patterns "$IOCS" "suspicious_workflow_patterns" | tr '\n' '|' | sed 's/|$//')
+    suspicious_workflow_files=$(json_extract_patterns "$IOCS" "suspicious_workflow_files")
     
     if [ -z "$patterns" ]; then
         patterns="toJSON\(secrets\)|shai-hulud|shai-hulud-workflow"

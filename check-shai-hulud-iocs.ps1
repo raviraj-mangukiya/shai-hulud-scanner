@@ -278,10 +278,9 @@ function Check-BundleJsInTarballs {
 function Check-SuspiciousWorkflows {
     Write-Host "[3/5] Checking for suspicious GitHub workflows..." -ForegroundColor Green
     
-    $workflowDirs = @(
-        Join-Path $projectRoot ".github\workflows",
-        Join-Path $projectRoot ".github"
-    )
+    $workflowDirs = @()
+    $workflowDirs += Join-Path $projectRoot ".github\workflows"
+    $workflowDirs += Join-Path $projectRoot ".github"
     
     $workflowFiles = @()
     foreach ($dir in $workflowDirs) {
