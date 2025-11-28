@@ -64,7 +64,7 @@ Write-Host "Based on Wiz Research" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-$projectRoot = Resolve-Path $ProjectPath
+$projectRoot = (Resolve-Path $ProjectPath).Path
 Write-Host "Scanning project: $projectRoot" -ForegroundColor Yellow
 Write-Host ""
 

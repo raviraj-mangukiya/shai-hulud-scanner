@@ -28,7 +28,14 @@ mkdir -p "$IOC_CACHE_DIR"
 # Check if jq is available
 if ! command -v jq >/dev/null 2>&1; then
     echo -e "${RED}Error: jq is required but not installed.${NC}"
-    echo "Install with: apt-get install jq (Debian/Ubuntu) or brew install jq (macOS)"
+    echo ""
+    echo "Installation options:"
+    echo "  - Debian/Ubuntu: sudo apt-get install jq"
+    echo "  - macOS: brew install jq"
+    echo "  - Windows: Use the PowerShell script instead: download-iocs.ps1"
+    echo ""
+    echo "The bash script requires jq for JSON parsing. On Windows, PowerShell scripts"
+    echo "are recommended as they don't require additional dependencies."
     exit 1
 fi
 

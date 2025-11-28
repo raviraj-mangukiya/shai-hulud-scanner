@@ -92,20 +92,20 @@ foreach ($source in $config.ioc_sources) {
                     fetched_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
                 }
                 
-                Write-Host "  ✓ Successfully fetched from $($source.name)" -ForegroundColor Green
+                Write-Host "  [OK] Successfully fetched from $($source.name)" -ForegroundColor Green
                 $success = $true
                 $successCount++
                 break
             }
         }
         catch {
-            Write-Host "  ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  [ERROR] Failed: $($_.Exception.Message)" -ForegroundColor Red
             continue
         }
     }
 
     if (-not $success) {
-        Write-Host "  ✗ Failed to fetch from $($source.name)" -ForegroundColor Red
+        Write-Host "  [ERROR] Failed to fetch from $($source.name)" -ForegroundColor Red
         $failCount++
     }
 }
