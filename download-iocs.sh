@@ -9,7 +9,12 @@ CONFIG_PATH="${1:-config.json}"
 FORCE="${2:-false}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/$CONFIG_PATH"
+# Handle both absolute and relative paths for CONFIG_PATH
+if [[ "$CONFIG_PATH" == /* ]]; then
+    CONFIG_FILE="$CONFIG_PATH"
+else
+    CONFIG_FILE="$SCRIPT_DIR/$CONFIG_PATH"
+fi
 IOC_CACHE_DIR="$SCRIPT_DIR/ioc-cache"
 IOC_CACHE_FILE="$IOC_CACHE_DIR/iocs.json"
 LAST_UPDATE_FILE="$IOC_CACHE_DIR/last-update.txt"
@@ -95,9 +100,19 @@ FAIL_COUNT=0
 SOURCES=$(echo "$ALL_IOCS" | jq -c '.ioc_sources[] | select(.enabled == true)')
 
 while IFS= read -r source; do
+    # Skip empty lines
+    if [ -z "$source" ]; then
+        continue
+    fi
+    
     SOURCE_NAME=$(echo "$source" | jq -r '.name')
     SOURCE_URL=$(echo "$source" | jq -r '.url')
     FALLBACK_URL=$(echo "$source" | jq -r '.fallback_url // empty')
+    
+    # Skip if source name is empty or null
+    if [ -z "$SOURCE_NAME" ] || [ "$SOURCE_NAME" = "null" ]; then
+        continue
+    fi
     
     echo -e "${YELLOW}Fetching from: $SOURCE_NAME${NC}"
     
